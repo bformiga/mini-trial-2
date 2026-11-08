@@ -81,6 +81,11 @@ class ArrayValueBridge(GSAUTPUBridge):
         return {"vdata": vec, "meta": dict(meta), "dtype": meta.get("dtype")}
 
 
+class SparseArrayValueBridge(ArrayValueBridge):
+    def _request_width(self, is_weight: bool) -> int:
+        return self.sa.weight_width if is_weight else 2 * self.size
+
+
 @dataclass
 class AtallaPlatform:
     """The built platform: its parts, and the clock that runs them.
@@ -121,17 +126,20 @@ def build_atalla_platform(program: Dict[int, int], data: Optional[Dict[int, int]
                           warm_icache: bool = False, perf: bool = True,
                           perf_timeline: bool = False, activity: bool = False,
                           init_sregs: Optional[Dict[int, int]] = None,
+                          meissa_size: Optional[int] = None, meissa_mixed: bool = False,
+                          mux_latency: int = 0,
                           **core_kw) -> AtallaPlatform:
     """`program` and `data` as load_program_text returns them; `data` words
-    go into DRAM. `systolic_array` is "meissa" (the RTL's) or "tpu"; extra
+    go into DRAM. `systolic_array` selects "meissa", "meissa_2of4" or "tpu". Extra
     keywords go to SchedulerCore. `perf` attaches a PerfMonitor
     (atalla/perf_monitor.py) as platform.perf; `perf_timeline` makes it keep
     the per-cycle timeline too. `activity` attaches an ActivityProbe
     (atalla/activity.py) as platform.activity, which records every block's
     state each cycle for tools/activity_view.py. `init_sregs` presets scalar
     registers, as a loader would (c_entry_sregs for compiled C)."""
+    structured = systolic_array == "meissa_2of4"
     parts = build_tpu_platform(dtype="bf16", lane_count=lane_count,
-                               systolic_array=systolic_array,
+                               systolic_array="meissa" if structured else systolic_array,
                                backend_dram_latency=dram_latency,
                                backend_dram_burst_bytes=burst_bytes)
     vc, dram, backends = parts.vc, parts.dram, parts.backends
@@ -148,7 +156,24 @@ def build_atalla_platform(program: Dict[int, int], data: Optional[Dict[int, int]
         core.warm_icache()
     for r, v in (init_sregs or {}).items():
         core.decode2.srf.storage.write(int(r), int(v) & MASK32)
-    sysarr_bridge = ArrayValueBridge(vc, parts.sa)
+    sa = parts.sa
+    bridge_type = ArrayValueBridge
+    if structured:
+        from systolic_array.structured_meissa import StructuredMEISSA
+
+        meissa_size = vc.vector_len // 2 if meissa_size is None else meissa_size
+        if 2 * meissa_size > vc.vector_len:
+            raise ValueError("sparse activations must fit one vector register")
+        sa = StructuredMEISSA(meissa_size, mux_latency=mux_latency, use_mixed_adder=meissa_mixed)
+        bridge_type = SparseArrayValueBridge
+    elif systolic_array == "meissa" and (meissa_size is not None or meissa_mixed):
+        from systolic_array.systolic_array_meissa import SystolicArrayMEISSA
+
+        size = sa.size if meissa_size is None else meissa_size
+        if size > vc.vector_len:
+            raise ValueError("dense activations must fit one vector register")
+        sa = SystolicArrayMEISSA(size, dtype="bf16", use_mixed_adder=meissa_mixed)
+    sysarr_bridge = bridge_type(vc, sa)
 
     # build_tpu_platform's tree, with the scheduler core in the vector core's
     # place: it ticks the vector core's units itself.
@@ -161,7 +186,7 @@ def build_atalla_platform(program: Dict[int, int], data: Optional[Dict[int, int]
     # sim_ram_rr's order: icache, dcache, scratchpads 0-3.
     root.add_child(RoundRobinBackendTicker([ports["icache"], ports["dcache"], *backends]),
                    phase=PHASE_BACKEND)
-    plat = AtallaPlatform(core=core, vc=vc, spad=parts.spad, sa=parts.sa, dram=dram,
+    plat = AtallaPlatform(core=core, vc=vc, spad=parts.spad, sa=sa, dram=dram,
                           backends=backends, vls_bridges=parts.vls_bridges,
                           sysarr_bridge=sysarr_bridge, ports=ports, root=root)
     if perf or activity:

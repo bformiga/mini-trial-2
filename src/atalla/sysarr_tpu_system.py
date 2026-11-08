@@ -305,7 +305,7 @@ class GSAUTPUBridge(Clocked):
         self._out_read_idx = 0
         self._warmup = self.sa.warmup_cycles()
         self._flush_pending = 0
-        self._zero_row = [0.0] * self.size
+        self._zero_row = [0.0] * self._request_width(False)
         self._input_done = False
         self.now = 0
         self.trace_hook = None
@@ -322,6 +322,9 @@ class GSAUTPUBridge(Clocked):
             vec[i] = _fp16_bits(val)
         return {"vdata": vec, "meta": dict(meta), "dtype": meta.get("dtype")}
 
+    def _request_width(self, is_weight: bool) -> int:
+        return self.size
+
     def tick(self, time: Optional[float] = None) -> None:
         if time is not None:
             self.now = time
@@ -336,13 +339,12 @@ class GSAUTPUBridge(Clocked):
         expect_output = False
         if req is not None:
             vdata = [float(x) for x in req.get("vdata", [])]
-            row = vdata[: self.size]
-            if len(row) < self.size:
-                row += [0.0] * (self.size - len(row))
+            is_weight = bool(req.get("is_weight", False))
+            width = self._request_width(is_weight)
+            row = vdata[:width] + [0.0] * max(0, width - len(vdata))
 
-            if bool(req.get("is_weight", False)):
+            if is_weight:
                 did_req = True
-                is_weight = True
                 assert self.sa.enqueue_weights(row, dtype=req.get("dtype"))
                 self.sa.set_control(weight_en=True, mac_shift=False, start=False, stall=False)
             else:

@@ -1,0 +1,8 @@
+__pycache__/
+.pytest_cache/
+*.py[cod]
+/benchmarks/
+/results/
+/logs/
+/build/
+/src/native/libatalla_kernels.so
