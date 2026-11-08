@@ -14,19 +14,32 @@ From the repository root, using Python 3.11 or newer:
 
 ```sh
 python -m pip install numpy==2.3.5
-python generate_benchmarks.py --workload resnet50_conv1
+python generate_benchmarks.py --workload resnet50_conv1 --seed 100
 python tools/run_sparse_benchmark.py --input benchmarks/resnet50_conv1.npz --k 160 --json results/resnet.json --output results/resnet_outputs.npz --trace-dir results/resnet_trace
 ```
 
 This uses eight activation rows, 16 output columns, and the full ResNet K dimension of 160. Comparison mode runs the same pruned weights through dense MEISSA and compressed 2:4 MEISSA. Each mode must match its own BF16 reference. Add `--mode dense-original` in a separate run for the unpruned baseline. Use `--rows`, `--cols`, and `--k` to select a leading submatrix, or `--full` to run all three dimensions. Full runs execute many independent output-block programs in series and can take substantially longer.
 
-Omit `--workload` to generate all three packages. The default seed is 100. Each workload has its own RNG stream, so generating it alone produces the same arrays as generating it alongside the others. The package contains BF16 operands held in float32 and FP32 NumPy references for the original dense weights (`C_dense_fp32`) and the pruned weights (`C_pruned_fp32`). These full-size NumPy products provide mathematical references. The optional `--output` file contains simulated DRAM outputs and matching, schedule-specific BF16 reference arrays, such as `dense-pruned` and `dense-pruned_reference`. BF16 rounding at each K pass can make the two simulated modes differ even with identical pruned weights.
+## Workload dimensions and seed
 
-| Workload | Full M × N × K |
-| --- | --- |
-| `resnet50_conv1` | 12,544 × 64 × 160 |
-| `llama3_q_proj` | 32 × 1,024 × 4,096 |
-| `llama3_gate_proj` | 256 × 1,024 × 4,096 |
+Run `python generate_benchmarks.py --seed 100` to regenerate all three packages in `benchmarks/`. Add `--workload NAME` for one workload or `--output-dir PATH` to write elsewhere. [generate_benchmarks.py](generate_benchmarks.py) calls the tracked [workload definitions](src/atalla/benchmarks/workloads.py).
+
+The generator writes `A[M,K]`, `W_dense[K,N]`, `W_pruned[K,N]`, `W_values[K/2,N]`, `W_indices[K/2,N]`, and two FP32 reference matrices of shape `[M,N]`. These dimensions describe the complete synthetic GEMMs, using the padded dimensions supplied in the original benchmark definitions. The generator fills those dimensions directly with synthetic operands, including the padded extent. It does not construct an unpadded model tensor and zero-fill its tail.
+
+| Workload | M | N | K | Seed stream index |
+| --- | ---: | ---: | ---: | ---: |
+| `resnet50_conv1` | 12,544 | 64 | 160 | 0 |
+| `llama3_q_proj` | 32 | 1,024 | 4,096 | 1 |
+| `llama3_gate_proj` | 256 | 1,024 | 4,096 | 2 |
+
+The default seed is **100**. Each workload uses NumPy `default_rng(SeedSequence([seed, stream_index]))`, so selecting a workload by itself produces the same operands as generating all workloads together. The package records the seed, stream index, NumPy version, `shape_MNK`, operand format, and sparsity axis in `metadata_json`. Use the documented NumPy version for input reproduction and the same NumPy and BLAS environment when checking FP32 references bit for bit.
+
+## Simulator padding and integration
+
+- The runner handles up to 32 requested rows per output block. A short final row block uses its actual row count. It zero-pads a short N block to 16 output columns and discards padded columns from the reported output.
+- A dense pass covers 16 K positions. The modeled sparse pass covers 32. Sparse inputs and sparse slices require K divisible by four. The runner zero-pads a short final K pass and supplies distinct indices for padded sparse groups. The three complete workload dimensions align to both K pass sizes and to 16 output columns.
+- The runner consumes the generated NPZ directly and builds the instructions and DRAM image for Trial 2's Atalla-Sim platform. It checks that the compressed values and indices reconstruct the pruned weights. With `--output`, it also saves each mode's simulated results and matching schedule-specific BF16 references, such as `dense-pruned` and `dense-pruned_reference`.
+- Matching the team's sparse RTL still requires confirming logical K per issue, the order of activation lanes, packed weight and metadata layout, valid/ready and mux timing, and the arithmetic formats and rounding. Confirm these against a sparse RTL tile trace before using the simulator's cycle counts as hardware estimates. The simulator results below cover selected submatrices.
 
 ## Numerically validated runs
 
