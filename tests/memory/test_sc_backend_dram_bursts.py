@@ -1,0 +1,109 @@
+import pytest
+
+
+from base.testing import build_sim
+
+from memory.backend import Backend
+
+
+def test_backend_stalls():
+    eq, clk, sim = build_sim()
+
+    writes = []
+    stores = []
+
+    def send_sram_write(sp_addr: int, row_bytes: bytes, row_idx: int, tx_id: int) -> bool:
+        writes.append((sp_addr, row_bytes, row_idx, tx_id))
+        return True
+
+    def send_sram_read(sp_addr: int, row_idx: int, tx_id: int) -> bytes:
+        data = bytes([row_idx + 1] * 32)  # 32 elements, value = row_idx+1
+        stores.append((sp_addr, data, row_idx, tx_id))
+        return data
+
+    # The backend model serializes DRAM-facing bursts, so even with dram_q_depth=2
+    # we should only see one active burst at a time.
+    backend = Backend(
+        dram_latency=2, dram_q_depth=2, dram_burst_bytes=4, elem_bytes=1,
+        send_sram_write=send_sram_write,
+        send_sram_read=send_sram_read
+    )
+
+    clk.add_clocked(backend)
+
+    # --- Test LOAD with serialized bursts ---
+    # 1 row, 32 cols, elem_bytes=1, burst_bytes=4 => 1 row * 8 subreqs/row = 8 bursts
+    # The DRAM-facing channel should launch those 8 bursts one at a time.
+    tx_id = backend.driver_to_backend_start_load(base_sp_addr=100, base_dram_addr=200, rows=1, cols=32)
+    print(f"started LOAD tx={tx_id}")
+
+    # Instrument burst issue/complete cycles to assert cycle-accurate latency.
+    issue_cycles = {}
+    complete_cycles = {}
+    in_response = False
+    orig_enqueue = backend._dram_pending.enqueue
+    orig_on_response = backend.dram_to_backend_on_response
+
+    def enqueue_with_time(req):
+        ok = orig_enqueue(req)
+        # Only record brand-new issues, not requeues.
+        if ok and not req.is_write and req.remaining_cycles == backend.dram_latency:
+            key = (req.tx_id, req.row, req.subidx, req.is_write)
+            issue_cycles[key] = (backend._tick, in_response)
+        return ok
+
+    def on_response_with_time(req):
+        nonlocal in_response
+        if not req.is_write:
+            key = (req.tx_id, req.row, req.subidx, req.is_write)
+            complete_cycles[key] = backend._tick
+        in_response = True
+        try:
+            return orig_on_response(req)
+        finally:
+            in_response = False
+
+    backend._dram_pending.enqueue = enqueue_with_time
+    backend.dram_to_backend_on_response = on_response_with_time
+
+    # Tick in whole cycles so burst timing is cycle-accurate.
+    max_cycles = 20
+    for cycle in range(max_cycles):
+        backend.tick(cycle)
+        st = backend.get_stats()
+        print(
+            f"[{cycle}] dram_pending={st['dram_pending']} "
+            f"issued={st['issued_bursts']} completed={st['completed_bursts']} "
+            f"stalls={st['backend_stalls']}"
+        )
+        if st["tx_completed"] == 1 and len(complete_cycles) == 8:
+            break
+
+    stats = backend.get_stats()
+    print("Backend stats after serialized bursts:", stats)
+    # The backend's stall counter includes deferred retry attempts while the
+    # serialized DRAM-facing channel is busy, so the timing checks below are the
+    # authoritative contract for this test.
+
+    # Cycle-accurate burst timing: each burst must complete after dram_latency cycles,
+    # and the next burst may only be launched once the channel becomes free.
+    total_bursts = 8
+    assert len(issue_cycles) == total_bursts, f"Expected {total_bursts} bursts issued, got {len(issue_cycles)}"
+    assert len(complete_cycles) == total_bursts, f"Expected {total_bursts} bursts completed, got {len(complete_cycles)}"
+    previous_issue = None
+    for key, issue_info in issue_cycles.items():
+        issue_cycle, issued_from_response = issue_info
+        assert key in complete_cycles, f"Missing completion record for burst {key}"
+        complete_cycle = complete_cycles[key]
+        min_complete = issue_cycle + backend.dram_latency - 1
+        max_complete = issue_cycle + backend.dram_latency
+        assert (
+            min_complete <= complete_cycle <= max_complete
+        ), f"Burst {key} completed at cycle {complete_cycle}, expected within [{min_complete}, {max_complete}]"
+        if previous_issue is not None:
+            assert issue_cycle >= previous_issue + 1, "Bursts were launched concurrently instead of serially"
+        previous_issue = issue_cycle
+    print("Backend serialized-burst test passed.")
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

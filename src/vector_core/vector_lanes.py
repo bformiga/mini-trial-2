@@ -1,0 +1,797 @@
+"""The vector lanes: element-wise ops and reductions on whole vectors.
+
+VectorDatapath.enqueue(src0, src1, op=...) starts one vector instruction. The
+vector is cut into lane_count equal slices; each VectorLane runs its slice
+through the functional unit for the op (alu, sqrt, exp, div, shift: each a
+FunctionalUnitPipeline with its own latency). The ResultCollector puts the
+slices back together, and for reductions combines the lanes' partial results
+in GlobalReductionUnit's tree. Finished vectors are taken with
+collector.pop_completed().
+
+To add an op: add it to _op_lut, and to _fu_for_op if it needs a unit other
+than the ALU (a new unit also needs a latency in VectorLane.fu_latencies).
+"""
+
+import math
+from base.clocked_object import Clocked
+from base.queue import SimQueue
+from typing import Callable, Dict, List, Optional, Sequence
+
+from base.dtype import DType, cast_scalar, cast_vector, normalize_dtype
+from base.sched import SCHED_ENABLED
+
+Time = float
+
+
+FLOAT_SLOT_BITS = 16
+
+
+def slice_width(vector_len: int, lane_count: int) -> int:
+    """Elements each lane handles per instruction."""
+    return vector_len // lane_count
+
+
+def lane_slice_indices(lane_id: int, slice_w: int) -> list:
+    """The vector element indices belonging to one lane, in order."""
+    base = lane_id * slice_w
+    return list(range(base, base + slice_w))
+
+
+def _safe_div(a: float, b: float) -> float:
+    if b == 0:
+        return float("inf") if a >= 0 else float("-inf")
+    return a / b
+
+
+def _exp(a: float) -> float:
+    try:
+        return math.exp(a)
+    except OverflowError:
+        return float("inf")
+
+
+def _op_lut() -> Dict[str, Callable[[float, float], float]]:
+    return {
+        "add": lambda a, b: a + b,
+        "sub": lambda a, b: a - b,
+        "mul": lambda a, b: a * b,
+        "max": lambda a, b: a if a >= b else b,
+        "min": lambda a, b: a if a <= b else b,
+        "and": lambda a, b: float(int(a) & int(b)),
+        "or": lambda a, b: float(int(a) | int(b)),
+        "xor": lambda a, b: float(int(a) ^ int(b)),
+        "sqrt": lambda a, _b: math.sqrt(a) if a >= 0 else float("nan"),
+        "exp": lambda a, _b: _exp(a),
+        "div": _safe_div,
+        "shl": lambda a, b: float(int(a) << int(b)),
+        "shr": lambda a, b: float(int(a) >> int(b)),
+        # Compares: 1.0 where true. The scheduler packs them into a mask.
+        "gt": lambda a, b: 1.0 if a > b else 0.0,
+        "lt": lambda a, b: 1.0 if a < b else 0.0,
+        "eq": lambda a, b: 1.0 if a == b else 0.0,
+        "ne": lambda a, b: 1.0 if a != b else 0.0,
+    }
+
+
+def _fu_for_op(op: str) -> str:
+    if op in ("sqrt",):
+        return "sqrt"
+    if op in ("exp",):
+        return "exp"
+    if op in ("div",):
+        return "div"
+    if op in ("shl", "shr"):
+        return "shift"
+    return "alu"
+
+
+class FunctionalUnitPipeline:
+    """A pipelined functional unit: everything pushed comes out `latency`
+    cycles later, up to `capacity` in flight.
+    """
+    def __init__(self, name: str, latency: int, capacity: int = 8):
+        self.name = name
+        self.latency = max(1, latency)
+        self.capacity = max(1, capacity)
+        self.entries = SimQueue(self.capacity)
+        self.completed = SimQueue(self.capacity * 4)
+
+    def can_accept(self) -> bool:
+        return not self.entries.is_full()
+
+    def push(self, payload: dict) -> bool:
+        if not self.can_accept():
+            return False
+        return self.entries.enqueue({"remain": self.latency, "payload": payload})
+
+    def tick(self, time: Optional[float] = None) -> None:
+        # Rotate the queue in place: pop each entry once and push the survivors
+        # back. Since survivors can only ever be fewer than the entries popped,
+        # capacity is never exceeded and relative order is preserved -- the
+        # same result as rebuilding the queue, without allocating one per FU
+        # per simulated cycle.
+        for _ in range(len(self.entries)):
+            entry = self.entries.dequeue()
+            if entry is None:
+                break
+            entry["remain"] -= 1
+            if entry["remain"] <= 0:
+                self.completed.enqueue(entry["payload"])
+            else:
+                self.entries.enqueue(entry)
+
+    def has_completed(self) -> bool:
+        return not self.completed.is_empty()
+
+    def pop_completed(self) -> Optional[dict]:
+        return self.completed.dequeue()
+
+
+class LaneFUContext:
+    """One instruction's work on one lane: its operands, which elements
+    are the lane's, and how many it has sent through its unit.
+    """
+    def __init__(
+        self,
+        inst_id: int,
+        op: str,
+        src0: Sequence[float],
+        src1: Sequence[float],
+        mask: Sequence[bool],
+        indices: List[int],
+        dst: int,
+        reduce: bool,
+        dtype: Optional[object] = None,
+    ):
+        self.inst_id = inst_id
+        self.op = op
+        self.src0 = src0
+        self.src1 = src1
+        self.mask = mask
+        self.indices = indices
+        self.dst = dst
+        self.reduce = reduce
+        self.dtype = normalize_dtype(dtype, default=DType.FP16)
+        self.cursor = 0
+        self.last_sent = False
+        self.pending_count = 0
+        self.reduce_accum = 0.0
+
+
+class GlobalReductionUnit:
+    """Combines values in a binary tree (sum, min or max), and lays the
+    result out in a vector (format_output_vector).
+    """
+    SUPPORTED_OPS = ("sum", "min", "max")
+    SUPPORTED_OUT_MODES = ("partial_zero", "partial_passthru", "broadcast")
+
+    def __init__(self, vector_len: int):
+        if vector_len <= 0:
+            raise ValueError("vector_len must be > 0")
+        self.vector_len = vector_len
+        self.tree_alus = max(1, vector_len // 2)
+        self.reduce_ops = 0
+
+    def _reduce_pair(self, op: str, a: float, b: float) -> float:
+        if op == "sum":
+            return a + b
+        if op == "min":
+            return a if a <= b else b
+        if op == "max":
+            return a if a >= b else b
+        raise ValueError("unsupported reduction op: %s" % op)
+
+    def reduce_tree(self, values: Sequence[float], op: str) -> Optional[float]:
+        """Reduce `values` pairwise, level by level, as the hardware's tree does
+        (the order matters for floating-point sums). None for no values.
+        """
+        if op not in self.SUPPORTED_OPS:
+            raise ValueError("unsupported reduction op: %s" % op)
+        if not values:
+            return None
+
+        level = list(values)
+        while len(level) > 1:
+            next_level = []
+            i = 0
+            while i + 1 < len(level):
+                next_level.append(self._reduce_pair(op, level[i], level[i + 1]))
+                self.reduce_ops += 1
+                i += 2
+            if i < len(level):
+                next_level.append(level[i])
+            level = next_level
+        return level[0]
+
+    def format_output_vector(
+        self,
+        reduction: Optional[float],
+        out_mode: str,
+        seed_vector: Optional[Sequence[float]] = None,
+        index: int = 0,
+    ) -> List[float]:
+        """broadcast: the result everywhere. partial_zero: the result at
+        `index`, zeros elsewhere. partial_passthru: the result at `index`
+        over `seed_vector`."""
+        if out_mode not in self.SUPPORTED_OUT_MODES:
+            raise ValueError("unsupported reduction out_mode: %s" % out_mode)
+        if seed_vector is None:
+            seed = [0.0] * self.vector_len
+        else:
+            seed = list(seed_vector)
+            if len(seed) != self.vector_len:
+                raise ValueError("seed_vector length mismatch")
+
+        if out_mode == "broadcast":
+            if reduction is None:
+                return seed
+            return [reduction] * self.vector_len
+
+        out = seed[:]
+        if reduction is not None and 0 <= index < len(out):
+            out[index] = reduction
+        return out
+
+
+class ResultCollector(Clocked):
+    """Gathers each lane's results and puts the vector back together.
+    A reduction's lane partials are combined here, reduction_alu_latency
+    cycles later. Finished vectors come out of pop_completed().
+    """
+    def __init__(
+        self,
+        lane_count: int,
+        vector_len: int,
+        sink_capacity: int = 32,
+        reduction_alu_latency: int = 4,
+    ):
+        super().__init__()
+        self.lane_count = lane_count
+        self.vector_len = vector_len
+        #: Must match the slicer: element e of lane L is vector element
+        #: L*slice_w + e, so results reassemble in the order they were cut.
+        self.slice_w = slice_width(vector_len, lane_count)
+        self._tick = -1
+        self.sink_capacity = max(1, sink_capacity)
+        self.reduction_alu_latency = max(1, reduction_alu_latency)
+        self.reduction_unit = GlobalReductionUnit(vector_len)
+        self.inflight = {}
+        self.completed_vectors = SimQueue(self.sink_capacity)
+        self.pending_reductions = SimQueue(max(1, self.sink_capacity * 4))
+
+    def can_accept_result(self) -> bool:
+        return not self.completed_vectors.is_full()
+
+    def allocate_instruction(
+        self,
+        inst_id: int,
+        dst: int,
+        op: str,
+        reduce: bool,
+        reduce_op: str = "sum",
+        reduce_out_mode: str = "partial_zero",
+        seed_vector: Optional[List[float]] = None,
+        dtype: Optional[DType] = None,
+        reduce_index: int = 0,
+    ) -> None:
+        """Start collecting results for instruction `inst_id`."""
+        if reduce:
+            if reduce_op not in self.reduction_unit.SUPPORTED_OPS:
+                raise ValueError("unsupported reduction op: %s" % reduce_op)
+            if reduce_out_mode not in self.reduction_unit.SUPPORTED_OUT_MODES:
+                raise ValueError("unsupported reduction out_mode: %s" % reduce_out_mode)
+        self.inflight[inst_id] = {
+            "dst": dst,
+            "op": op,
+            "reduce": reduce,
+            "reduce_op": reduce_op,
+            "reduce_out_mode": reduce_out_mode,
+            "reduce_index": reduce_index,
+            "vector": (seed_vector[:] if seed_vector is not None else [0.0] * self.vector_len),
+            "dtype": dtype,
+            "lane_done": [False] * self.lane_count,
+            "lane_pending": [0] * self.lane_count,
+            "reduce_accum": [0.0] * self.lane_count,
+            "reduce_seen": [False] * self.lane_count,
+            "reduce_count": 0,
+            "completion_scheduled": False,
+        }
+
+    def lane_dispatched(self, inst_id: int, lane_id: int) -> None:
+        self.inflight[inst_id]["lane_pending"][lane_id] += 1
+
+    def lane_reduce_accum(self, inst_id: int, lane_id: int, value: float) -> None:
+        """Fold one of a lane's values into its partial reduction."""
+        state = self.inflight[inst_id]
+        reduce_op = state["reduce_op"]
+        if reduce_op == "sum":
+            state["reduce_accum"][lane_id] += value
+        elif reduce_op == "min":
+            if not state["reduce_seen"][lane_id]:
+                state["reduce_accum"][lane_id] = value
+            else:
+                state["reduce_accum"][lane_id] = min(state["reduce_accum"][lane_id], value)
+        elif reduce_op == "max":
+            if not state["reduce_seen"][lane_id]:
+                state["reduce_accum"][lane_id] = value
+            else:
+                state["reduce_accum"][lane_id] = max(state["reduce_accum"][lane_id], value)
+        else:
+            raise ValueError("unsupported reduction op: %s" % reduce_op)
+        state["reduce_seen"][lane_id] = True
+        state["reduce_count"] += 1
+
+    def lane_result(self, inst_id: int, lane_id: int, lane_elem_idx: int, value: float) -> None:
+        state = self.inflight[inst_id]
+        vector_idx = lane_id * self.slice_w + lane_elem_idx
+        if vector_idx < self.vector_len:
+            state["vector"][vector_idx] = value
+        state["lane_pending"][lane_id] -= 1
+        self._try_complete(inst_id)
+
+    def lane_done(self, inst_id: int, lane_id: int) -> None:
+        self.inflight[inst_id]["lane_done"][lane_id] = True
+        self._try_complete(inst_id)
+
+    def _try_complete(self, inst_id: int) -> None:
+        state = self.inflight.get(inst_id)
+        if state is None:
+            return
+        if state["completion_scheduled"]:
+            return
+        if not all(state["lane_done"]):
+            return
+        if any(p != 0 for p in state["lane_pending"]):
+            return
+
+        reduction = None
+        if state["reduce"]:
+            lane_partials = [
+                state["reduce_accum"][lane_id]
+                for lane_id in range(self.lane_count)
+                if state["reduce_seen"][lane_id]
+            ]
+            reduction = self.reduction_unit.reduce_tree(lane_partials, state["reduce_op"])
+            state["vector"] = self.reduction_unit.format_output_vector(
+                reduction=reduction,
+                out_mode=state["reduce_out_mode"],
+                seed_vector=(state["vector"] if state["reduce_out_mode"] == "partial_passthru" else None),
+                index=state["reduce_index"],
+            )
+        packet = {
+            "inst_id": inst_id,
+            "dst": state["dst"],
+            "op": state["op"],
+            "reduce_op": state["reduce_op"],
+            "reduce_out_mode": state["reduce_out_mode"],
+            "vector": state["vector"][:],
+            "reduction": reduction,
+            "dtype": state.get("dtype"),
+        }
+
+        if not state["reduce"]:
+            if not self.completed_vectors.enqueue(packet):
+                return
+            del self.inflight[inst_id]
+            return
+
+        n = state["reduce_count"]
+        remaining_cycles = max(0, (n - 1) * self.reduction_alu_latency)
+        if remaining_cycles == 0:
+            if not self.completed_vectors.enqueue(packet):
+                return
+            del self.inflight[inst_id]
+            return
+
+        if not self.pending_reductions.enqueue(
+            {
+                "inst_id": inst_id,
+                "remain": remaining_cycles,
+                "packet": packet,
+            }
+        ):
+            return
+        state["completion_scheduled"] = True
+
+    def tick(self, time: Optional[float] = None) -> None:
+        cycle = self._consume_tick(time, attr_name="_tick")
+        if cycle is None:
+            return
+
+        # Same in-place rotation as FunctionalUnitPipeline.tick.
+        for _ in range(len(self.pending_reductions)):
+            item = self.pending_reductions.dequeue()
+            if item is None:
+                break
+            if item["remain"] > 0:
+                item["remain"] -= 1
+            if item["remain"] <= 0:
+                if not self.completed_vectors.enqueue(item["packet"]):
+                    self.pending_reductions.enqueue(item)
+                else:
+                    inst_id = item["inst_id"]
+                    if inst_id in self.inflight:
+                        del self.inflight[inst_id]
+            else:
+                self.pending_reductions.enqueue(item)
+
+    def pop_completed(self) -> Optional[dict]:
+        item = self.completed_vectors.dequeue()
+        if item is not None:
+            for pending_inst_id in list(self.inflight.keys()):
+                self._try_complete(pending_inst_id)
+        return item
+
+
+class VectorLane(Clocked):
+    """One lane: a functional unit per kind of op (fu_latencies), each
+    working through its slice of the vector one element a cycle.
+    """
+    def __init__(
+        self,
+        lane_id: int,
+        lane_count: int,
+        fu_latencies: Optional[Dict[str, int]] = None,
+        fu_capacity: int = 8,
+    ):
+        super().__init__()
+        if lane_count <= 0:
+            raise ValueError("lane_count must be > 0")
+        if lane_id < 0 or lane_id >= lane_count:
+            raise ValueError("lane_id must be in [0, lane_count)")
+
+        self.lane_id = lane_id
+        self.lane_count = lane_count
+        self._tick = -1
+        self.ops = _op_lut()
+        self.fu_latencies = {
+            "alu": 4,
+            "sqrt": 8,
+            "exp": 14,
+            "div": 11,
+            "shift": 3, # not in the report? VC used an xbar here, but tbh we can abstract this
+        }
+        if fu_latencies:
+            self.fu_latencies.update(fu_latencies)
+
+        self.fus = {}
+        for fu, lat in self.fu_latencies.items():
+            self.fus[fu] = FunctionalUnitPipeline(fu, lat, capacity=fu_capacity)
+
+        self.fu_ctx = {}
+        self.meta_fifo = {}
+        self.pending_outputs = SimQueue(2048)
+        self.op_counts = {op: 0 for op in self.ops}
+        self.total_ops = 0
+        for fu in self.fu_latencies:
+            self.fu_ctx[fu] = None
+            self.meta_fifo[fu] = SimQueue(fu_capacity)
+
+    def _lane_indices(self, vector_len: int) -> List[int]:
+        """This lane's contiguous slice of the vector."""
+        return lane_slice_indices(self.lane_id, slice_width(vector_len, self.lane_count))
+
+    def is_idle(self) -> bool:
+        """True when every stage of tick() would find nothing to do.
+
+        Stage 1 walks fu_ctx, stage 2 the pipelines, stage 3 pairs completed
+        results with meta, stage 4 drains pending_outputs. With all four empty
+        the tick is a no-op, which is the common case whenever the workload
+        drives the systolic path rather than the vector ALUs.
+        """
+        for ctx in self.fu_ctx.values():
+            if ctx is not None:
+                return False
+        if not self.pending_outputs.is_empty():
+            return False
+        for fu in self.fus.values():
+            if not fu.entries.is_empty() or not fu.completed.is_empty():
+                return False
+        for mf in self.meta_fifo.values():
+            if not mf.is_empty():
+                return False
+        return True
+
+    def can_issue(self, fu_name: str) -> bool:
+        return self.fu_ctx[fu_name] is None
+
+    def issue(self, context: LaneFUContext, fu_name: str) -> bool:
+        if not self.can_issue(fu_name):
+            return False
+        self.fu_ctx[fu_name] = context
+        return True
+
+    def tick(self, time: Optional[float] = None, collector: Optional[ResultCollector] = None) -> None:
+        if collector is None and time is not None and not isinstance(time, (int, float)):
+            collector = time
+            time = None
+        if collector is None:
+            raise ValueError("collector is required")
+
+        cycle = self._consume_tick(time, attr_name="_tick")
+        if cycle is None:
+            return
+
+        # Stage 1: sequencer routes one element/FU/cycle with ready/valid semantics.
+        for fu_name, ctx in self.fu_ctx.items():
+            if ctx is None:
+                continue
+
+            if ctx.cursor >= len(ctx.indices):
+                if not ctx.last_sent:
+                    collector.lane_done(ctx.inst_id, self.lane_id)
+                    ctx.last_sent = True
+                    self.fu_ctx[fu_name] = None
+                continue
+
+            if not self.fus[fu_name].can_accept():
+                continue
+
+            lane_elem_idx = ctx.cursor
+            vector_idx = ctx.indices[ctx.cursor]
+            ctx.cursor += 1
+            active = bool(ctx.mask[vector_idx])
+
+            if active:
+                value = self.ops[ctx.op](ctx.src0[vector_idx], ctx.src1[vector_idx])
+                value = cast_scalar(value, ctx.dtype)
+                pushed = self.fus[fu_name].push({"value": value})
+                if pushed:
+                    self.op_counts[ctx.op] += 1
+                    self.total_ops += 1
+                    self.meta_fifo[fu_name].enqueue(
+                        {
+                            "inst_id": ctx.inst_id,
+                            "lane_elem_idx": lane_elem_idx,
+                            "dst": ctx.dst,
+                            "reduce": ctx.reduce,
+                            "value": value,
+                        }
+                    )
+                    collector.lane_dispatched(ctx.inst_id, self.lane_id)
+                    ctx.pending_count += 1
+                    if ctx.reduce:
+                        ctx.reduce_accum += value
+                        collector.lane_reduce_accum(ctx.inst_id, self.lane_id, value)
+                else:
+                    # Pipeline refused entry; retry this element next cycle.
+                    ctx.cursor -= 1
+
+            if ctx.cursor >= len(ctx.indices) and not ctx.last_sent:
+                collector.lane_done(ctx.inst_id, self.lane_id)
+                ctx.last_sent = True
+                if ctx.pending_count == 0:
+                    self.fu_ctx[fu_name] = None
+
+        # Stage 2: execute pipelines. A pipeline with nothing in flight cannot
+        # change state, and most of them are empty most of the time.
+        for fu in self.fus.values():
+            if SCHED_ENABLED and fu.entries.is_empty():
+                continue
+            fu.tick(time)
+
+        # Stage 3: pair FU output with metadata FIFO.
+        for fu_name, fu in self.fus.items():
+            while fu.has_completed() and (not self.meta_fifo[fu_name].is_empty()):
+                payload = fu.pop_completed()
+                meta = self.meta_fifo[fu_name].dequeue()
+                ctx = self.fu_ctx[fu_name]
+                if ctx is not None:
+                    ctx.pending_count -= 1
+                    if ctx.last_sent and ctx.pending_count == 0:
+                        self.fu_ctx[fu_name] = None
+                if not self.pending_outputs.enqueue(
+                    {
+                        "inst_id": meta["inst_id"],
+                        "lane_elem_idx": meta["lane_elem_idx"],
+                        "value": payload["value"],
+                    }
+                ):
+                    raise RuntimeError("lane pending output queue overflow")
+
+        # Stage 4: forward to result collector with backpressure.
+        while (not self.pending_outputs.is_empty()) and collector.can_accept_result():
+            item = self.pending_outputs.dequeue()
+            if item is None:
+                break
+            collector.lane_result(
+                item["inst_id"],
+                self.lane_id,
+                item["lane_elem_idx"],
+                item["value"],
+            )
+
+
+class VectorDatapath(Clocked):
+    """The lanes together: enqueue() takes a vector instruction, slices it
+    across the lanes and returns its id; the result comes out of the collector.
+    """
+    def __init__(
+        self,
+        veggie_size: int,
+        lane_count: int = 1,
+        dtype: Optional[object] = None,
+        issue_width: int = 1,
+        fu_latencies: Optional[Dict[str, int]] = None,
+    ):
+        super().__init__()
+        if veggie_size <= 0:
+            raise ValueError("veggie_size must be > 0")
+        if lane_count <= 0:
+            raise ValueError("lane_count must be > 0")
+        if issue_width <= 0:
+            raise ValueError("issue_width must be > 0")
+        if veggie_size % FLOAT_SLOT_BITS != 0:
+            raise ValueError("veggie_size must be divisible by %d" % FLOAT_SLOT_BITS)
+
+        self.veggie_size = veggie_size
+        self.dtype = normalize_dtype(dtype, default=None)
+        self.vector_len = veggie_size // FLOAT_SLOT_BITS
+        # The slicer cuts the vector into lane_count equal pieces, so the lane
+        # count has to divide it. Silently clamping instead (as this did) gives
+        # a machine with a different width than the caller asked for.
+        if self.vector_len % lane_count != 0:
+            raise ValueError(
+                "lane_count %d does not divide a %d-element vector"
+                % (lane_count, self.vector_len))
+        self.lane_count = lane_count
+        self.slice_w = slice_width(self.vector_len, self.lane_count)
+        self.issue_width = issue_width
+        self._tick = -1
+        self.next_inst_id = 0
+        self.alu_latency = 4
+        if fu_latencies and ("alu" in fu_latencies):
+            self.alu_latency = max(1, fu_latencies["alu"])
+
+        self.lanes = [
+            VectorLane(i, self.lane_count, fu_latencies=fu_latencies)
+            for i in range(self.lane_count)
+        ]
+        self.collector = ResultCollector(
+            self.lane_count,
+            self.vector_len,
+            reduction_alu_latency=self.alu_latency,
+        )
+        self.pending_issue = SimQueue(128)
+
+        self.result_valid = False
+        self.last_result = None
+
+    def _mk_src1(self, src0: Sequence[float], src1: Optional[Sequence[float]]) -> Sequence[float]:
+        if src1 is None:
+            return [0.0] * len(src0)
+        return [float(x) for x in src1]
+
+    def enqueue(
+        self,
+        src0: Sequence[float],
+        src1: Optional[Sequence[float]] = None,
+        mask: Optional[Sequence[bool]] = None,
+        op: str = "add",
+        dst: int = 0,
+        reduce: bool = False,
+        reduce_op: str = "sum",
+        reduce_out_mode: str = "partial_zero",
+        dtype: Optional[object] = None,
+        reduce_index: int = 0,
+    ) -> int:
+        """Queue one vector instruction; returns its id.
+
+        `op` is a name in _op_lut; src1 defaults to zeros, mask to every element.
+        With reduce=True the result is reduce_op over the masked elements, laid out
+        as reduce_out_mode says (see GlobalReductionUnit.format_output_vector).
+        """
+        if len(src0) != self.vector_len:
+            raise ValueError("src0 length mismatch")
+        op_dtype = normalize_dtype(dtype, default=self.dtype)
+        if op_dtype is None:
+            raise ValueError("dtype must be specified")
+        src0_full = cast_vector(src0, op_dtype)
+        src1_full = self._mk_src1(src0_full, src1)
+        src1_full = cast_vector(src1_full, op_dtype)
+        if len(src1_full) != self.vector_len:
+            raise ValueError("src1 length mismatch")
+        mask_full = list(mask) if mask is not None else [True] * self.vector_len
+        if len(mask_full) != self.vector_len:
+            raise ValueError("mask length mismatch")
+        if op not in _op_lut():
+            raise ValueError("unsupported op: %s" % op)
+        if reduce:
+            if reduce_op not in self.collector.reduction_unit.SUPPORTED_OPS:
+                raise ValueError("unsupported reduction op: %s" % reduce_op)
+            if reduce_out_mode not in self.collector.reduction_unit.SUPPORTED_OUT_MODES:
+                raise ValueError("unsupported reduction out_mode: %s" % reduce_out_mode)
+
+        inst_id = self.next_inst_id
+        self.next_inst_id += 1
+        if not self.pending_issue.enqueue(
+            {
+                "inst_id": inst_id,
+                "src0": src0_full,
+                "src1": list(src1_full),
+                "mask": mask_full,
+                "op": op,
+                "dst": dst,
+                "reduce": reduce,
+                "reduce_op": reduce_op,
+                "reduce_out_mode": reduce_out_mode,
+                "reduce_index": reduce_index,
+                "dtype": op_dtype,
+            }
+        ):
+            raise RuntimeError("datapath pending issue queue overflow")
+        self.wake()
+        return inst_id
+
+    def next_wake(self, now: int) -> Optional[int]:
+        """Asleep with nothing queued, in the lanes or in the collector, and
+        no result still showing. enqueue wakes it."""
+        c = self.collector
+        if (self.result_valid or not self.pending_issue.is_empty() or c.inflight
+                or not c.pending_reductions.is_empty() or not c.completed_vectors.is_empty()):
+            return now + 1
+        for lane in self.lanes:
+            if not lane.is_idle():
+                return now + 1
+        return None
+
+    def _can_issue_to_all_lanes(self, fu_name: str) -> bool:
+        for lane in self.lanes:
+            if not lane.can_issue(fu_name):
+                return False
+        return True
+
+    def tick(self, time: Optional[float] = None) -> None:
+        cycle = self._consume_tick(time, attr_name="_tick")
+        if cycle is None:
+            return
+
+        # The collector's tick only ages pending reductions; with none queued
+        # it cannot change anything.
+        if not (SCHED_ENABLED and self.collector.pending_reductions.is_empty()):
+            self.collector.tick(cycle)
+        issued = 0
+        while (not self.pending_issue.is_empty()) and issued < self.issue_width:
+            inst = self.pending_issue.peek()
+            if inst is None:
+                break
+            fu_name = _fu_for_op(inst["op"])
+            if not self._can_issue_to_all_lanes(fu_name):
+                break
+
+            self.pending_issue.dequeue()
+            self.collector.allocate_instruction(
+                inst["inst_id"],
+                inst["dst"],
+                inst["op"],
+                inst["reduce"],
+                reduce_op=inst["reduce_op"],
+                reduce_out_mode=inst["reduce_out_mode"],
+                seed_vector=(inst["src0"] if inst["reduce"] and inst["reduce_out_mode"] == "partial_passthru" else None),
+                dtype=inst.get("dtype"),
+                reduce_index=inst.get("reduce_index", 0),
+            )
+            for lane in self.lanes:
+                ctx = LaneFUContext(
+                    inst_id=inst["inst_id"],
+                    op=inst["op"],
+                    src0=inst["src0"],
+                    src1=inst["src1"],
+                    mask=inst["mask"],
+                    indices=lane._lane_indices(self.vector_len),
+                    dst=inst["dst"],
+                    reduce=inst["reduce"],
+                    dtype=inst.get("dtype", self.dtype),
+                )
+                lane.issue(ctx, fu_name)
+            issued += 1
+
+        for lane in self.lanes:
+            if SCHED_ENABLED and lane.is_idle():
+                continue
+            lane.tick(cycle, self.collector)
+
+        completed = self.collector.pop_completed()
+        self.result_valid = completed is not None
+        if completed is not None:
+            self.last_result = completed

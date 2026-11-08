@@ -1,0 +1,938 @@
+"""The vector core: the vector units and the register file they share.
+
+VectorCore owns the units -- the lane datapath (vector_lanes.py), four VLSUs
+(vector_load_store.py), the GSAU (the systolic array's port, below) and the
+transpose unit (transpose.py) -- and the vector register file (Veggie,
+veggie_file.py). It can be driven two ways:
+
+  tick()        the harnesses' way: instructions queued with
+                enqueue_scheduler_instruction() are packed into VLIW packets,
+                their operands read out of the register file, issued, and
+                one result a cycle written back through WBBuffer.
+  tick_units()  the scheduler's way (scheduler/vector.py): the scheduler
+                hands each unit its data itself and arbitrates writeback, so
+                only the units are advanced.
+
+To add a unit: construct it in __init__, tick it in both tick() and
+tick_units(), and, for the harness path, add an _issue_<unit> and a _wb_<unit>.
+"""
+
+from base.clocked_object import Clocked
+from base.queue import SimQueue
+from typing import Dict, List, Optional, Sequence, Tuple, Union
+
+from base.dtype import DType, cast_vector, normalize_dtype
+from vector_core.transpose import TransposeUnit
+from vector_core.vector_lanes import VectorDatapath
+from vector_core.vector_load_store import VLSU
+from vector_core.veggie_file import OpBuffer, Veggie
+
+Time = float
+
+#: One VLIW slot group per functional unit, in issue order. Every packet
+#: carries a list per name and every name has a `<name>_slots` width on the
+#: core, so adding a unit is one entry here plus its issue and writeback hooks.
+PACKET_UNITS = ("gsau", "vlsu", "transpose", "datapath")
+
+
+class _Bundle:
+    """Loose signal bundle for the Veggie/OpBuffer connect() protocol."""
+
+    def __init__(self, **fields):
+        self.__dict__.update(fields)
+
+
+class WBBuffer(Clocked):
+    """
+    Shared writeback buffer for vector functional units.
+    """
+
+    def __init__(self, depth: int = 128):
+        super().__init__()
+        self.entries = SimQueue(max(1, depth))
+        self._reserved_banks = set()
+
+    def can_accept(self) -> bool:
+        return not self.entries.is_full()
+
+    def start_cycle(self) -> None:
+        self._reserved_banks.clear()
+
+    def can_accept_entry(self, entry: Dict) -> bool:
+        """Room for `entry`, and no other entry this cycle or queued writes
+        its register-file bank?
+        """
+        if self.entries.is_full():
+            return False
+        bank = entry.get("bank")
+        if bank is None:
+            return True
+        if bank in self._reserved_banks:
+            return False
+        for queued in self.entries._raw_items:
+            if queued.get("bank") == bank:
+                return False
+        return True
+
+    def enqueue(self, entry: Dict) -> bool:
+        if not self.can_accept_entry(entry):
+            return False
+        bank = entry.get("bank")
+        if bank is not None:
+            self._reserved_banks.add(bank)
+        return self.entries.enqueue(entry)
+
+    def has_pending(self) -> bool:
+        return not self.entries.is_empty()
+
+    def peek(self) -> Optional[Dict]:
+        return self.entries.peek()
+
+    def pop(self) -> Optional[Dict]:
+        return self.entries.dequeue()
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+
+class SchedulerBacklogView:
+    """len() is how many instructions wait to issue (for queue-depth reports)."""
+    def __init__(self, owner: "VectorCore"):
+        self.owner = owner
+
+    def __len__(self) -> int:
+        return self.owner.scheduler_backlog()
+
+
+class SchedulerPacketView:
+    """len() is how many packets wait to issue (for queue-depth reports)."""
+    def __init__(self, owner: "VectorCore"):
+        self.owner = owner
+
+    def __len__(self) -> int:
+        return self.owner.scheduler_packet_count()
+
+
+class GSAU(Clocked):
+    """
+    Global Systolic Array Unit control block.
+
+    Responsibilities:
+    - Accept scheduler-issued vectors and stream them to systolic-array control.
+    - Track destination register indices in-order via rd FIFO.
+    - Pair returning systolic vectors with rd queue and emit WB packets.
+    """
+
+    def __init__(
+        self,
+        max_vregs: int = 256,
+        instruction_latency_mac: int = 64,
+        clocks_per_mac_cycle: int = 3,
+        req_depth: int = 256,
+        rsp_depth: int = 256,
+    ):
+        super().__init__()
+        self.max_vregs = max(1, int(max_vregs))
+        self.instruction_latency_mac = max(1, int(instruction_latency_mac))
+        self.clocks_per_mac_cycle = max(1, int(clocks_per_mac_cycle))
+        self._tick = -1
+        # Formula-driven destination queue depth in entries.
+        self.rd_queue_depth = max(1, self.instruction_latency_mac * self.clocks_per_mac_cycle)
+
+        self.to_systolic = SimQueue(max(1, int(req_depth)))
+        self.from_systolic = SimQueue(max(1, int(rsp_depth)))
+        self.rd_queue = SimQueue(self.rd_queue_depth)
+        self.writebacks = SimQueue(max(1, int(rsp_depth)))
+
+    def issue(self, cmd: Dict) -> bool:
+        """Send a row to the systolic array: {"vdata", "dtype", "is_weight",
+        "dst" (for rows that produce an output), "meta"}. The output, when it
+        comes back, is written to `dst`; outputs come back in issue order. False
+        if the queues are full (try again next cycle).
+        """
+        entry = dict(cmd)
+        dtype = normalize_dtype(entry.get("dtype"), default=None)
+        if dtype is None:
+            raise ValueError("gsau command missing dtype")
+        expects_output = bool(entry.get("expect_output", not bool(entry.get("is_weight", False))))
+        meta = entry.get("meta", {})
+        if self.to_systolic.is_full():
+            return False
+        if expects_output:
+            dst = entry.get("dst")
+            if dst is None:
+                raise ValueError("gsau command missing dst for expected output")
+            if self.rd_queue.is_full():
+                return False
+            if not self.rd_queue.enqueue(
+                {
+                    "dst": int(dst),
+                    "dtype": dtype,
+                    "meta": meta,
+                }
+            ):
+                return False
+
+        vdata = entry["vdata"] if isinstance(entry["vdata"], list) else list(entry["vdata"])
+        self.wake()
+        return self.to_systolic.enqueue(
+            {
+                "vdata": vdata,
+                "is_weight": bool(entry.get("is_weight", False)),
+                "dtype": dtype,
+                "meta": meta,
+                "expect_output": expects_output,
+            }
+        )
+
+    def pop_systolic_request(self) -> Optional[Dict]:
+        return self.to_systolic.dequeue()
+
+    def push_systolic_response(self, rsp: Dict) -> bool:
+        """Accept an output row from the systolic array (its "vdata")."""
+        packet = rsp
+        if "vdata" not in packet and "data" in packet:
+            packet = dict(rsp)
+            packet["vdata"] = packet["data"]
+        if "vdata" not in packet:
+            raise ValueError("gsau response missing vdata")
+        if not isinstance(packet["vdata"], list):
+            packet = dict(packet)
+            packet["vdata"] = list(packet["vdata"])
+        self.wake()
+        return self.from_systolic.enqueue(packet)
+
+    def can_pop_writeback(self) -> bool:
+        return not self.writebacks.is_empty()
+
+    def pop_writeback(self) -> Optional[Dict]:
+        return self.writebacks.dequeue()
+
+    def has_pending(self) -> bool:
+        return (not self.to_systolic.is_empty()) or (not self.from_systolic.is_empty())
+
+    def next_wake(self, now: int) -> Optional[int]:
+        """Its tick only pairs results with destinations: asleep with no
+        result waiting. push_systolic_response wakes it."""
+        return None if self.from_systolic.is_empty() else now + 1
+
+    def tick(self, time: Optional[Time] = None) -> None:
+        cycle = self._consume_tick(time, attr_name="_tick")
+        if cycle is None:
+            return
+
+        while (not self.from_systolic.is_empty()) and (not self.rd_queue.is_empty()) and (not self.writebacks.is_full()):
+            rsp = self.from_systolic.dequeue()
+            rd = self.rd_queue.dequeue()
+            if rsp is None or rd is None:
+                break
+            rsp_dtype = normalize_dtype(
+                rsp.get("dtype") or rsp.get("meta", {}).get("dtype"),
+                default=None,
+            )
+            if rd.get("dtype") is None or rsp_dtype is None:
+                raise ValueError("gsau response missing dtype")
+            if rsp_dtype != rd.get("dtype"):
+                raise ValueError("gsau dtype mismatch: rd=%s rsp=%s" % (rd.get("dtype"), rsp_dtype))
+            self.writebacks.enqueue(
+                {
+                    "dst": int(rd["dst"]),
+                    "data": list(rsp["vdata"]),
+                    "mask": rsp.get("mask"),
+                    "dtype": rd.get("dtype"),
+                    "meta": {
+                        "rdq_depth": self.rd_queue_depth,
+                        "rdq_entry": rd.get("meta", {}),
+                        "rsp_meta": rsp.get("meta", {}),
+                    },
+                }
+            )
+
+
+class VectorCore(Clocked):
+    """
+    Integrated Vector Core shell.
+
+    Integrates:
+    - VectorDatapath (compute operations)
+    - Veggie (vector register file storage backing)
+    - VLSU(s) (scratchpad load/store path)
+    - GSAU (systolic-array ingress/egress + rd queue tracking)
+    - TransposeUnit (tile transpose, one row in or one column out per issue)
+    - WBBuffer (common result sink before VRF write)
+    """
+
+    def __init__(
+        self,
+        veggie_size: int, # width of one vector register value (used to determine vector_len = veggie_size / FLOAT_SLOT_BITS)
+        lane_count: int = 1,
+        dtype: Optional[object] = None,
+        issue_width: int = 1,
+        vls_count: int = 4,   # one per scratchpad
+        wb_depth: int = 128,
+        scheduler_depth: int = 128,
+        fu_latencies: Optional[Dict[str, int]] = None,
+        veggie_bank_count: int = 4,
+        veggie_regs_per_bank: int = 64,
+    ):
+        super().__init__()
+        if vls_count <= 0:
+            raise ValueError("vls_count must be > 0")
+        self._tick = -1
+
+        self.dtype_default = normalize_dtype(dtype, default=None)
+        self.datapath = VectorDatapath(
+            veggie_size=veggie_size,
+            lane_count=lane_count,
+            dtype=self.dtype_default,
+            issue_width=issue_width,
+            fu_latencies=fu_latencies,
+        )
+        self.vector_len = self.datapath.vector_len
+
+        self.veggie = Veggie(
+            bank_count=veggie_bank_count,
+            regs_per_bank=veggie_regs_per_bank,
+        )
+        self.max_vregs = self.veggie.bank_count * self.veggie.regs_per_bank # number of vregs available
+
+        self.wb_buffer = WBBuffer(depth=wb_depth)
+
+        # Operand collection: datapath sources are read out of the register
+        # file through its ports and gathered here before the instruction can
+        # issue, so bank arbitration is part of the timing instead of being
+        # bypassed by a direct data_banks[] read.
+        self._veggie_in = _Bundle(read_reqs=[], write_reqs=[])
+        self._veggie_out = _Bundle(vreg={}, dvalid={}, mvalid={}, vmask={}, ready=True)
+        self.veggie.connect(self._veggie_in, self._veggie_out)
+        self.op_buffer = OpBuffer(num_pairs=max(1, issue_width))
+        self._opbuf_out = _Bundle(ivalid=[], vreg=[], vmask=[], ready=False)
+        self.op_buffer.connect(self._veggie_out, self._opbuf_out)
+        #: One in-flight operand fetch per collector slot.
+        self._fetch = [None] * self.op_buffer.num_pairs
+        self.gsau = GSAU(max_vregs=self.max_vregs)
+        # The transpose tile is as wide as a vector: one row per push, one
+        # column per popped vector.
+        self.transpose = TransposeUnit(vec_len=self.vector_len)
+        self.gsau_slots = 1
+        self.vlsu_slots = 4
+        self.transpose_slots = 1
+        self.datapath_slots = 2
+        self.vliw_q = SimQueue(max(1, scheduler_depth))
+        self._build_packet = self._empty_packet()
+        self.scheduler_q = SchedulerBacklogView(self)
+        self.scheduler_packets = SchedulerPacketView(self)
+
+        self.vls_units = []
+        for _ in range(vls_count):
+            # Each VLSU is wired to one scratchpad frontend.
+            self.vls_units.append(VLSU(scratchpad_count=1, read_vreg_cb=self.read_vreg))
+
+        # The units, ticked in this order by tick_children; each sleeps
+        # while it has nothing to do (base/sched.py).
+        for unit in (self.datapath, *self.vls_units, self.gsau, self.transpose):
+            self.add_child(unit)
+
+        self.last_wb = None
+        self.wb_valid = False
+        self.last_datapath_inst_id = None
+        self._datapath_wb_hold = None
+
+    def _reg_to_bank_addr(self, reg: int) -> Tuple[int, int]:
+        if reg < 0:
+            raise ValueError("register index must be >= 0")
+        bank = reg % self.veggie.bank_count
+        addr = reg // self.veggie.bank_count
+        if addr >= self.veggie.regs_per_bank:
+            raise ValueError("register index out of range: %s" % reg)
+        return bank, addr
+
+    def _normalize_vector(self, data: Sequence[float]) -> List[float]:
+        vec = [float(x) for x in data]
+        if len(vec) != self.vector_len:
+            raise ValueError(
+                "vector length mismatch: expected %d, got %d"
+                % (self.vector_len, len(vec))
+            )
+        return vec
+
+    def read_vreg(self, reg: int) -> List[float]:
+        """Register `reg`'s value, untimed (no port or bank is used)."""
+        bank, addr = self._reg_to_bank_addr(reg)
+        raw = self.veggie.data_banks[bank][addr]
+        if isinstance(raw, list):
+            if len(raw) == self.vector_len:
+                return [float(x) for x in raw]
+            if len(raw) == 0:
+                return [0.0] * self.vector_len
+            if len(raw) < self.vector_len:
+                return [float(x) for x in raw] + ([0.0] * (self.vector_len - len(raw)))
+            return [float(x) for x in raw[: self.vector_len]]
+        return [float(raw)] * self.vector_len
+
+    def read_vreg_with_dtype(self, reg: int) -> Tuple[List[float], DType]:
+        bank, addr = self._reg_to_bank_addr(reg)
+        vec = self.read_vreg(reg)
+        dtype = self.veggie.dtype_banks[bank][addr]
+        dtype = normalize_dtype(dtype, default=self.dtype_default)
+        if dtype is None:
+            raise ValueError("dtype must be specified for vreg %s" % reg)
+        if self.veggie.dtype_banks[bank][addr] is None:
+            self.veggie.dtype_banks[bank][addr] = dtype
+        return vec, dtype
+
+    def write_vreg(self, reg: int, data: Sequence[float], dtype: Optional[object] = None) -> None:
+        """Set register `reg`, untimed, rounded to `dtype`."""
+        bank, addr = self._reg_to_bank_addr(reg)
+        dtype_norm = normalize_dtype(dtype, default=self.dtype_default)
+        if dtype_norm is None:
+            raise ValueError("dtype must be specified for write_vreg")
+        vec = cast_vector(data, dtype_norm)
+        if len(vec) != self.vector_len:
+            raise ValueError(
+                "vector length mismatch: expected %d, got %d"
+                % (self.vector_len, len(vec))
+            )
+        self.veggie.data_banks[bank][addr] = vec
+        self.veggie.dtype_banks[bank][addr] = dtype_norm
+
+    def enqueue_scheduler_instruction(self, inst: Dict) -> bool:
+        """
+        Enqueue one scheduler-issued instruction.
+
+        Supported instruction classes:
+        - Compute:   {"unit":"datapath", "op", "dst", "src0", "src1?", ...}
+        - Memory:    {"unit":"vlsu", "kind":"load|store", "vls":0/1, ...}
+        - GSAU:      {"unit":"gsau", ...}
+        - Transpose: {"unit":"transpose", "kind":"push", "src": reg|vector}
+                     {"unit":"transpose", "kind":"pop", "dst": reg|[regs]}
+        """
+        entry = dict(inst)
+        if not self._packet_append_inst(self._build_packet, entry):
+            if not self._flush_build_packet():
+                return False
+            if not self._packet_append_inst(self._build_packet, entry):
+                raise ValueError("instruction does not fit in VLIW packet: %s" % entry.get("unit", "datapath"))
+        return True
+
+    def _empty_packet(self) -> Dict[str, List[Dict]]:
+        return {unit: [] for unit in PACKET_UNITS}
+
+    def _packet_has_entries(self, packet: Dict[str, List[Dict]]) -> bool:
+        return any(packet[unit] for unit in PACKET_UNITS)
+
+    def _slot_width(self, unit: str) -> int:
+        return int(getattr(self, unit + "_slots"))
+
+    def _packet_append_inst(self, packet: Dict[str, List[Dict]], inst: Dict) -> bool:
+        unit = inst.get("unit", "datapath")
+        if unit not in PACKET_UNITS:
+            raise ValueError("unsupported scheduler unit: %s" % unit)
+        if len(packet[unit]) >= self._slot_width(unit):
+            return False
+        packet[unit].append(inst)
+        return True
+
+    def _flush_build_packet(self) -> bool:
+        if not self._packet_has_entries(self._build_packet):
+            return True
+        if self.vliw_q.is_full():
+            return False
+        packet = self._build_packet
+        self._build_packet = self._empty_packet()
+        if not self.vliw_q.enqueue(packet):
+            self._build_packet = packet
+            return False
+        return True
+
+    def enqueue_memory(self, op: Dict) -> bool:
+        inst = dict(op)
+        inst.setdefault("unit", "vlsu")
+        return self.enqueue_scheduler_instruction(inst)
+
+    def _resolve_operand_with_dtype(self, value, default_zero: bool, dtype_hint: Optional[object]) -> Tuple[List[float], DType]:
+        if value is None:
+            if default_zero:
+                dtype_norm = normalize_dtype(dtype_hint, default=self.dtype_default)
+                if dtype_norm is None:
+                    raise ValueError("dtype must be specified")
+                return [0.0] * self.vector_len, dtype_norm
+            raise ValueError("missing required operand")
+        if isinstance(value, int):
+            vec, dtype = self.read_vreg_with_dtype(value)
+            return vec, dtype
+        dtype_norm = normalize_dtype(dtype_hint, default=self.dtype_default)
+        if dtype_norm is None:
+            raise ValueError("dtype must be specified")
+        return self._normalize_vector(value), dtype_norm
+
+    def _resolve_mask(self, mask_value) -> List[bool]:
+        if mask_value is None:
+            return [True] * self.vector_len
+        if isinstance(mask_value, int):
+            mask_vec = self.read_vreg(mask_value)
+            return [bool(x) for x in mask_vec]
+        mask = list(mask_value)
+        if len(mask) != self.vector_len:
+            raise ValueError("mask length mismatch")
+        return [bool(x) for x in mask]
+
+    def _issue_datapath(self, inst: Dict) -> bool:
+        op = inst.get("op")
+        if op is None:
+            raise ValueError("datapath instruction missing op")
+        dst = inst.get("dst", inst.get("vd"))
+        if dst is None:
+            raise ValueError("datapath instruction missing dst")
+
+        slot = next((i for i, f in enumerate(self._fetch) if f is None), None)
+        if slot is None:
+            return False            # every collector slot is occupied
+        self._fetch[slot] = {"inst": inst, "op": op, "dst": int(dst)}
+        return True
+
+    def _start_operand_fetch(self, slot: int) -> None:
+        """Drive this slot's register reads at the VRF."""
+        fetch = self._fetch[slot]
+        inst = fetch["inst"]
+        dtype_hint = inst.get("dtype")
+        specs = (
+            (inst.get("src0", inst.get("vs1")), False,
+             inst.get("src0_dtype", dtype_hint)),
+            (inst.get("src1", inst.get("vs2")), True,
+             inst.get("src1_dtype", dtype_hint)),
+        )
+        for i, (spec, default_zero, hint) in enumerate(specs):
+            port = 2 * slot + i
+            # Ask the collector, not the fetch record: an operand that has
+            # already landed is held there until the slot completes. Re-driving
+            # it would make it win its bank again every cycle and starve the
+            # sibling it collided with.
+            if self.op_buffer.dready[port]:
+                continue
+            if isinstance(spec, int):
+                bank, addr = self._reg_to_bank_addr(spec)
+                # dtype is register metadata, not data on the read port.
+                _, dtype = self.read_vreg_with_dtype(spec)
+                fetch["dtype%d" % i] = dtype
+                self._veggie_in.read_reqs.append(
+                    {"port": port, "bank": bank, "addr": addr, "reg": spec})
+            else:
+                # An immediate needs no bank, but the slot still has to see it.
+                vec, dtype = self._resolve_operand_with_dtype(
+                    spec, default_zero=default_zero, dtype_hint=hint)
+                fetch["dtype%d" % i] = dtype
+                self.op_buffer.present(port, vec)
+
+    def _complete_operand_fetch(self, slot: int) -> bool:
+        """True once both operands are in hand and the instruction issued."""
+        fetch = self._fetch[slot]
+        if fetch.get("got0") is None or fetch.get("got1") is None:
+            return False
+        inst = fetch["inst"]
+        src0, src1 = fetch["got0"], fetch["got1"]
+        dtype0 = fetch.get("dtype0")
+        dtype1 = fetch.get("dtype1", dtype0)
+        if dtype0 != dtype1:
+            raise ValueError("datatype mismatch: src0=%s src1=%s" % (dtype0, dtype1))
+        mask = self._resolve_mask(inst.get("mask"))
+        op, dst = fetch["op"], fetch["dst"]
+
+        inst_id = self.datapath.enqueue(
+            src0=src0,
+            src1=src1,
+            mask=mask,
+            op=op,
+            dst=dst,
+            reduce=bool(inst.get("reduce", False)),
+            reduce_op=inst.get("reduce_op", "sum"),
+            reduce_out_mode=inst.get("reduce_out_mode", "partial_zero"),
+            dtype=dtype0,
+        )
+        self.last_datapath_inst_id = inst_id
+        return True
+
+    def _operand_cycle(self, cycle) -> None:
+        """Pull every outstanding operand out of the register file.
+
+        Reads go through the VRF's ports, so two sources in one bank serialise
+        and the loser is re-driven next cycle; the collector holds whatever has
+        arrived until a slot has its whole pair.
+        """
+        self._veggie_in.read_reqs = []
+        self._veggie_in.write_reqs = []
+        for slot, fetch in enumerate(self._fetch):
+            if fetch is None:
+                continue
+            self._start_operand_fetch(slot)
+            self.op_buffer.present_mask(slot, True)
+
+        if self._veggie_in.read_reqs:
+            self.veggie.tick(cycle)
+            self.op_buffer.tick(cycle)
+
+        for slot, fetch in enumerate(self._fetch):
+            if fetch is None:
+                continue
+            if self.op_buffer.slot_ready(slot):
+                (a, b), _mask = self.op_buffer.take(slot)
+                fetch["got0"], fetch["got1"] = a, b
+            if self._complete_operand_fetch(slot):
+                self._fetch[slot] = None
+
+    def _issue_vlsu(self, inst: Dict) -> bool:
+        vls_id = int(inst.get("vls", 0))
+        if vls_id < 0 or vls_id >= len(self.vls_units):
+            raise ValueError("invalid vls id: %s" % vls_id)
+
+        op = dict(inst)
+        op.pop("unit", None)
+        op.pop("vls", None)
+        # VLSU instance is tied to one frontend; force local frontend 0.
+        op["scratchpad"] = 0
+        if "dst" in op and "vd" not in op:
+            op["vd"] = op["dst"]
+        if "src" in op and "vs" not in op:
+            op["vs"] = op["src"]
+        return self.vls_units[vls_id].enqueue_issue(op)
+
+    def _issue_gsau(self, inst: Dict) -> bool:
+        cmd = dict(inst)
+        cmd.pop("unit", None)
+        src_spec = cmd.get("src", cmd.get("vs"))
+        vdata_spec = cmd.get("vdata")
+        dtype_hint = cmd.get("dtype")
+        if vdata_spec is None:
+            if src_spec is None:
+                raise ValueError("gsau instruction requires src or vdata")
+            if isinstance(src_spec, int):
+                vdata, dtype0 = self.read_vreg_with_dtype(src_spec)
+            else:
+                dtype0 = normalize_dtype(dtype_hint, default=self.dtype_default)
+                if dtype0 is None:
+                    raise ValueError("dtype must be specified")
+                vdata = self._normalize_vector(src_spec)
+        else:
+            if isinstance(vdata_spec, int):
+                vdata, dtype0 = self.read_vreg_with_dtype(vdata_spec)
+            else:
+                dtype0 = normalize_dtype(dtype_hint, default=self.dtype_default)
+                if dtype0 is None:
+                    raise ValueError("dtype must be specified")
+                vdata = self._normalize_vector(vdata_spec)
+        vdata = cast_vector(vdata, dtype0)
+
+        expects_output = bool(cmd.get("expect_output", not bool(cmd.get("is_weight", False))))
+        gsau_meta = dict(cmd.get("meta", {}) or {})
+        gsau_meta.setdefault("kind", cmd.get("kind"))
+        gsau_meta.setdefault("src", src_spec)
+        gsau_meta.setdefault("dtype", dtype0)
+        gsau_cmd = {
+            "vdata": vdata,
+            "is_weight": bool(cmd.get("is_weight", False)),
+            "expect_output": expects_output,
+            "meta": gsau_meta,
+            "dtype": dtype0,
+        }
+        if expects_output:
+            dst = cmd.get("dst", cmd.get("vd"))
+            if dst is None:
+                raise ValueError("gsau instruction missing dst")
+            gsau_cmd["dst"] = int(dst)
+        return self.gsau.issue(gsau_cmd)
+
+    def _issue_transpose(self, inst: Dict) -> bool:
+        """One transpose instruction: a row in, or a whole tile out.
+
+        push  src   a register index, or an inline vector
+        pop   dst   one register (columns land in dst, dst+1, ...) or a list
+                    of vector_len registers, one per column
+
+        A pop is a single instruction because the unit drains the whole tile
+        off one request -- there is no per-column handshake to issue against.
+        """
+        kind = inst.get("kind", "push")
+        if kind not in ("push", "pop"):
+            raise ValueError("transpose kind must be 'push' or 'pop': %s" % kind)
+
+        if kind == "push":
+            src = inst.get("src", inst.get("vs"))
+            if src is None:
+                raise ValueError("transpose push requires src")
+            vec = self.read_vreg(src) if isinstance(src, int) \
+                else self._normalize_vector(src)
+            return self.transpose.push(vec)
+
+        dst = inst.get("dst", inst.get("vd"))
+        if dst is None:
+            raise ValueError("transpose pop requires dst")
+        if isinstance(dst, int):
+            dsts = [dst + i for i in range(self.vector_len)]
+        else:
+            dsts = [int(d) for d in dst]
+            if len(dsts) != self.vector_len:
+                raise ValueError(
+                    "transpose pop needs %d destinations, got %d"
+                    % (self.vector_len, len(dsts))
+                )
+        for reg in dsts:
+            self._reg_to_bank_addr(reg)
+        return self.transpose.pop(dsts)
+
+    def _try_issue_scheduler(self) -> None:
+        _ = self._flush_build_packet()
+        packet = self.vliw_q.peek()
+        if packet is None:
+            return
+        for issue_fn, unit in (
+            (self._issue_gsau, "gsau"),
+            (self._issue_vlsu, "vlsu"),
+            (self._issue_transpose, "transpose"),
+            (self._issue_datapath, "datapath"),
+        ):
+            remaining = []
+            for inst in packet[unit]:
+                if not issue_fn(inst):
+                    remaining.append(inst)
+            packet[unit] = remaining
+        if not self._packet_has_entries(packet):
+            _ = self.vliw_q.dequeue()
+
+    def _collect_results_to_wb(self) -> None:
+        """Move this cycle's finished results into the writeback buffer, by
+        priority: VLSU 0, the other VLSUs, the GSAU and transpose unit,
+        reductions, then the lane datapath. A result the buffer can't take
+        stays where it is for next cycle. Each source's _wb_* method below
+        builds its candidate entries; (priority, key, entry, raw) each."""
+        pkt, candidates = self._wb_datapath()
+        candidates += self._wb_vlsus() + self._wb_gsau() + self._wb_transpose()
+
+        accepted_datapath = False
+        for _prio, src_key, entry, raw in sorted(candidates, key=lambda x: x[0]):
+            if not self.wb_buffer.enqueue(entry):
+                continue
+            if src_key == "datapath":
+                accepted_datapath = True
+                self._datapath_wb_hold = None
+            elif src_key == "gsau":
+                _ = self.gsau.pop_writeback()
+            elif src_key == "transpose":
+                _ = self.transpose.pop_writeback()
+            else:
+                _ = self.vls_units[src_key[1]].pop_writeback()
+
+        if pkt is not None and not accepted_datapath:
+            self._datapath_wb_hold = pkt
+
+    def _wb_datapath(self):
+        """The lane datapath's finished vector (or the one held from last
+        cycle), as (packet, candidates)."""
+        candidates = []
+        pkt = self._datapath_wb_hold
+        if pkt is None and self.datapath.result_valid:
+            pkt = self.datapath.last_result
+        if pkt is not None:
+            bank, _ = self._reg_to_bank_addr(int(pkt["dst"]))
+            reduction = pkt.get("reduction")
+            candidates.append(
+                (
+                    3 if reduction is not None else 4,
+                    "datapath",
+                    {
+                        "source": "datapath",
+                        "dst": pkt["dst"],
+                        "data": pkt["vector"],
+                        "dtype": pkt.get("dtype"),
+                        "bank": bank,
+                        "meta": {
+                            "inst_id": pkt["inst_id"],
+                            "op": pkt["op"],
+                            "reduce_op": pkt["reduce_op"],
+                            "reduce_out_mode": pkt["reduce_out_mode"],
+                            "reduction": reduction,
+                        },
+                    },
+                    pkt,
+                )
+            )
+        return pkt, candidates
+
+    def _wb_vlsus(self):
+        """Each VLSU's next load result."""
+        candidates = []
+        for vls_id, vls in enumerate(self.vls_units):
+            wb = vls.wb_q.peek()
+            if wb is None:
+                continue
+            bank, _ = self._reg_to_bank_addr(int(wb["vd"]))
+            meta = dict(wb.get("meta", {}) or {})
+            meta.setdefault("addr", wb.get("addr"))
+            meta.setdefault("scratchpad", wb.get("scratchpad"))
+            meta.setdefault("vd", wb.get("vd"))
+            candidates.append(
+                (
+                    0 if vls_id == 0 else 1,
+                    ("vlsu", vls_id),
+                    {
+                        "source": "vlsu",
+                        "vls": vls_id,
+                        "dst": wb["vd"],
+                        "data": wb["data"],
+                        "mask": wb.get("mask"),
+                        "dtype": wb.get("dtype"),
+                        "bank": bank,
+                        "meta": meta,
+                    },
+                    wb,
+                )
+            )
+        return candidates
+
+    def _wb_gsau(self):
+        """The GSAU's next systolic-array result."""
+        candidates = []
+        wb = self.gsau.writebacks.peek()
+        if wb is not None:
+            bank, _ = self._reg_to_bank_addr(int(wb["dst"]))
+            meta = dict(wb.get("meta", {}) or {})
+            meta.update(dict(meta.get("rdq_entry", {}) or {}))
+            meta.update(dict(meta.get("rsp_meta", {}) or {}))
+            candidates.append(
+                (
+                    2,
+                    "gsau",
+                    {
+                        "source": "gsau",
+                        "dst": wb["dst"],
+                        "data": wb["data"],
+                        "mask": wb.get("mask"),
+                        "dtype": wb.get("dtype"),
+                        "bank": bank,
+                        "meta": meta,
+                    },
+                    wb,
+                )
+            )
+        return candidates
+
+    def _wb_transpose(self):
+        """The transpose unit's next column."""
+        candidates = []
+        wb = self.transpose.peek_writeback()
+        if wb is not None:
+            if "dst" not in wb:
+                raise ValueError("transpose writeback missing dst")
+            bank, _ = self._reg_to_bank_addr(int(wb["dst"]))
+            candidates.append(
+                (
+                    2,
+                    "transpose",
+                    {
+                        "source": "transpose",
+                        "dst": wb["dst"],
+                        "data": wb["data"],
+                        "dtype": self.dtype_default,
+                        "bank": bank,
+                        "meta": {"col": wb["col"]},
+                    },
+                    wb,
+                )
+            )
+        return candidates
+
+    def _commit_one_writeback(self) -> None:
+        self.wb_valid = False
+        self.last_wb = None
+
+        wb = self.wb_buffer.pop()
+        if wb is None:
+            return
+
+        dst = int(wb["dst"])
+        new_vec = self._normalize_vector(wb["data"])
+        wb_dtype = normalize_dtype(wb.get("dtype"), default=None)
+        mask = wb.get("mask")
+        if mask is not None:
+            mask_vec = [bool(x) for x in list(mask)]
+            if len(mask_vec) != self.vector_len:
+                raise ValueError("writeback mask length mismatch")
+            old_vec = self.read_vreg(dst)
+            _, old_dtype = self.read_vreg_with_dtype(dst)
+            if wb_dtype is not None and wb_dtype != old_dtype:
+                raise ValueError("masked writeback dtype mismatch: dst=%s wb=%s" % (old_dtype, wb_dtype))
+            merged = [new_vec[i] if mask_vec[i] else old_vec[i] for i in range(self.vector_len)]
+            self.write_vreg(dst, merged, dtype=old_dtype)
+        else:
+            if wb_dtype is None:
+                _, old_dtype = self.read_vreg_with_dtype(dst)
+                wb_dtype = old_dtype
+            self.write_vreg(dst, new_vec, dtype=wb_dtype)
+
+        self.last_wb = wb
+        self.wb_valid = True
+
+    def tick(self, time: Optional[Time] = None) -> None:
+        cycle = self._consume_tick(time, attr_name="_tick")
+        if cycle is None:
+            return
+
+        # 1) Consume one VLIW packet when target units can accept its slots.
+        self._try_issue_scheduler()
+
+        # 2) Collect operands out of the register file for anything waiting.
+        self._operand_cycle(cycle)
+
+        # 3) Advance compute and memory units.
+        self.tick_children(cycle)
+
+        # 3) Funnel unit outputs into shared writeback buffer.
+        self.wb_buffer.start_cycle()
+        self._collect_results_to_wb()
+
+        # 4) Commit one writeback per cycle to Veggie.
+        self._commit_one_writeback()
+
+    # -- driven by the scheduler model ---------------------------------------------
+    def tick_units(self, time: Optional[Time] = None) -> None:
+        """Advance the execution units only.
+
+        The scheduler model (src/scheduler/vector.py) drives the units the
+        way the RTL's scheduler does: decode 2 reads every operand, each unit
+        is handed data, and writeback is arbitrated on the scheduler side.
+        So it bypasses the packet queue, operand fetch and writeback buffer
+        that tick() runs for the harnesses.
+        """
+        cycle = self._consume_tick(time, attr_name="_tick")
+        if cycle is None:
+            return
+        self.tick_children(cycle)
+
+    def pop_scratchpad_request(self, vls_id: int) -> Optional[Dict]:
+        if vls_id < 0 or vls_id >= len(self.vls_units):
+            raise ValueError("invalid vls id: %s" % vls_id)
+        return self.vls_units[vls_id].pop_request()
+
+    def push_scratchpad_response(self, vls_id: int, rsp: Dict) -> bool:
+        if vls_id < 0 or vls_id >= len(self.vls_units):
+            raise ValueError("invalid vls id: %s" % vls_id)
+        local_rsp = dict(rsp)
+        local_rsp["scratchpad"] = 0
+        return self.vls_units[vls_id].push_response(local_rsp)
+
+    def scheduler_backlog(self) -> int:
+        total = 0
+        if self._packet_has_entries(self._build_packet):
+            total += sum(len(self._build_packet[unit]) for unit in PACKET_UNITS)
+        for packet in self.vliw_q._raw_items:
+            total += sum(len(packet[unit]) for unit in PACKET_UNITS)
+        return total
+
+    def scheduler_packet_count(self) -> int:
+        return len(self.vliw_q) + (1 if self._packet_has_entries(self._build_packet) else 0)
+
+    def pop_systolic_request(self) -> Optional[Dict]:
+        return self.gsau.pop_systolic_request()
+
+    def push_systolic_response(self, rsp: Dict) -> bool:
+        return self.gsau.push_systolic_response(rsp)
+
