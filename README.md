@@ -2,6 +2,12 @@
 
 These synthetic GEMMs retain the padded shapes from the original benchmark generator. The runner assembles Atalla instructions and DRAM data, then executes them on the full Atalla-Sim scheduler, memory system, vector core, and MEISSA model. See the [upstream simulator README](README) for the other simulator flows.
 
+## Open RTL timing blocker
+
+Confirm how many logical K positions the team's MEISSA RTL covers per sparse GEMM issue. The benchmark keeps a physical 16×16 grid and models 16 logical K positions per dense pass and 32 per sparse pass. Loading two weights and their indices per group of four establishes the compression format. The activation delivery and issue timing determine whether the same grid can cover twice as many logical K positions in one pass.
+
+Until the K-per-issue mapping is confirmed, report these cycle counts and speedups as results of the modeled schedule. If sparse RTL keeps the same logical K per issue, update the pass schedule before using these numbers to estimate RTL performance.
+
 ## Reproduce a comparison
 
 From the repository root, using Python 3.11 or newer:
@@ -22,7 +28,7 @@ Omit `--workload` to generate all three packages. The default seed is 100. Each 
 | `llama3_q_proj` | 32 × 1,024 × 4,096 |
 | `llama3_gate_proj` | 256 × 1,024 × 4,096 |
 
-## Validated runs
+## Numerically validated runs
 
 These runs used seed 100, 6-cycle DRAM latency, 8-byte bursts, and zero extra mux cycles. Both modes matched their own BF16 reference bit for bit in each run.
 
