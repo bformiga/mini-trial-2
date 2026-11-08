@@ -42,6 +42,27 @@ These runs used seed 100, 6-cycle DRAM latency, 8-byte bursts, and zero extra mu
 
 The ResNet unpruned baseline also matched its reference at 8 × 16 × 160. The full workload inputs and FP32 references were generated for all three workloads. The table reports simulated submatrices.
 
+## Numerical formats and RTL comparison
+
+The same formats apply to ResNet50 and both Llama workloads. The workload selects matrix shapes and synthetic data. The benchmark implementation selects the numerical format.
+
+| Data | Numerical format | Representation |
+| --- | --- | --- |
+| Trial 2 activations and weights | BF16 | NumPy float32 arrays containing exactly representable BF16 values. The simulator packs them as 16-bit BF16 words in DRAM. |
+| Full-size NumPy references | FP32 | `C_dense_fp32` and `C_pruned_fp32` are FP32 matrix products computed from the BF16-rounded operands. |
+| Simulated results and schedule-specific references | BF16 | The model uses FP32 products and tree results, rounds each array pass to BF16, and rounds each cross-pass vector addition to BF16. The optional output NPZ stores those values as NumPy float32 arrays. |
+| Original PyTorch generator | FP16 | The original script generated FP16 activations and weights and saved both operands and reference outputs as FP16. |
+
+For a generated Trial 2 package, inspect the metadata and array dtypes from the repository root:
+
+```sh
+python -c "import json, numpy as np; f=np.load('benchmarks/resnet50_conv1.npz'); print(json.loads(f['metadata_json'].item())['dtype']); print({k: str(f[k].dtype) for k in ('A', 'W_dense', 'C_dense_fp32', 'C_pruned_fp32')})"
+```
+
+The expected first line is `bf16`. The array dtypes on the next line are `float32`. The metadata identifies the modeled operand precision and the NumPy dtype identifies the storage container.
+
+The upstream dense MEISSA model documents a BF16 RTL configuration with FP32 products and adder-tree sums, followed by BF16 reduction. The team's current sparse RTL configuration still needs confirmation. Check the activation and weight format, accumulator precision, and output format and rounding in its top-level configuration and testbench. A 16-bit width alone leaves the format ambiguous. IEEE FP16 uses 5 exponent bits and 10 fraction bits. BF16 uses 8 exponent bits and 7 fraction bits. A testbench that drives the value 1.0 as a raw word uses `16'h3c00` for FP16 or `16'h3f80` for BF16. If the team's sparse RTL uses FP16 or a different output or accumulation format, Trial 2's numerical reference needs to be matched to that configuration.
+
 ## Sparse layout
 
 - `A[M,K]` and `W_dense[K,N]` use BF16 values. For each output column, the generator keeps the two largest-magnitude weights per contiguous group of four along K. A tie selects the lower K position. `W_values[K/2,N]` and `W_indices[K/2,N]` store the retained values and their positions in ascending order within each group. There are always two stored slots, which can include zero. The runner checks that the requested compressed weights reconstruct `W_pruned[K,N]`.
